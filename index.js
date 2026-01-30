@@ -2,11 +2,14 @@ require("dotenv").config();
 
 const { Telegraf, Markup } = require("telegraf");
 const PDFDocument = require("pdfkit");
+const { createCheckoutSession } = require("./stripe");
+
+if (!process.env.BOT_TOKEN) throw new Error("BOT_TOKEN is not set");
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// состояния пользователей в памяти (пока без базы)
-const state = new Map(); // userId -> { step, draft }
+// state in memory: userId -> { step, draft }
+const state = new Map();
 
 function getUser(userId) {
   if (!state.has(userId)) state.set(userId, { step: null, draft: {} });
@@ -23,15 +26,38 @@ function formatDateEuropeWarsaw(date = new Date()) {
 }
 
 function formatMoney(amountNumber) {
+  const n = Number(amountNumber);
+  if (!Number.isFinite(n)) return String(amountNumber);
   return new Intl.NumberFormat("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
-  }).format(amountNumber);
+  }).format(n);
+}
+
+function buildPdfBuffer({ client, service, amount, currency, dateStr }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 50 });
+
+    const chunks = [];
+    doc.on("data", (c) => chunks.push(c));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    doc.fontSize(20).text("INVOICE", { align: "center" });
+    doc.moveDown();
+
+    doc.fontSize(12).text(`Клиент: ${client}`);
+    doc.text(`Услуга: ${service}`);
+    doc.text(`Сумма: ${formatMoney(amount)} ${currency}`);
+    doc.text(`Дата: ${dateStr}`);
+
+    doc.end();
+  });
 }
 
 bot.start((ctx) => {
   ctx.reply(
-    "Привет! Я бот для счётов 🧾\n\nКоманды:\n/new — новый счёт\n/cancel — отмена"
+    "Привет! Я бот для счетов 🧾\n\nКоманды:\n/new — новый счёт\n/cancel — отмена"
   );
 });
 
@@ -52,8 +78,7 @@ bot.command("new", async (ctx) => {
 bot.on("text", async (ctx) => {
   const u = getUser(ctx.from.id);
   const text = (ctx.message.text || "").trim();
-
-  if (!u.step) return; // если не в процессе /new — игнорим
+  if (!u.step) return;
 
   if (u.step === "client") {
     u.draft.client = text;
@@ -72,10 +97,10 @@ bot.on("text", async (ctx) => {
     const num = Number(normalized);
 
     if (!Number.isFinite(num) || num <= 0) {
-      return ctx.reply("Не похоже на число 😅 Пример: 1200 или 1200.50");
+      return ctx.reply("Не похоже на число 😕 Пример: 1200 или 1200.50");
     }
 
-    u.draft.amount = num; // хранить числом
+    u.draft.amount = num;
     u.step = "currency";
 
     return ctx.reply(
@@ -86,7 +111,6 @@ bot.on("text", async (ctx) => {
 
   if (u.step === "currency") {
     const cur = text.toUpperCase();
-
     if (!["PLN", "EUR", "USD"].includes(cur)) {
       return ctx.reply(
         "Выбери валюту кнопкой: PLN / EUR / USD",
@@ -101,58 +125,51 @@ bot.on("text", async (ctx) => {
     u.step = null;
     u.draft = {};
 
-    // убираем клавиатуру, чтобы не залипала
     await ctx.reply("Принято, делаю PDF…", Markup.removeKeyboard());
 
-    // --- PDF в память (без файлов на диске) ---
-    const fileName = `invoice_${Date.now()}.pdf`;
+    try {
+      const dateStr = formatDateEuropeWarsaw(new Date());
+      const amountStr = formatMoney(d.amount);
 
-    const doc = new PDFDocument({ margin: 50 });
+      // 1) PDF buffer
+      const pdfBuffer = await buildPdfBuffer({
+        client: d.client,
+        service: d.service,
+        amount: d.amount,
+        currency: d.currency,
+        dateStr,
+      });
 
-    const chunks = [];
-    doc.on("data", (c) => chunks.push(c));
+      // 2) Stripe Checkout URL
+      const checkoutUrl = await createCheckoutSession({
+        amount: d.amount,
+        currency: d.currency,
+        description: `Оплата: ${d.service}`,
+        metadata: {
+          client: d.client,
+          service: d.service,
+          currency: d.currency,
+          amount: String(d.amount),
+          date: dateStr,
+          telegram_user_id: String(ctx.from.id),
+        },
+      });
 
-    doc.on("error", async (err) => {
-      console.error("PDF error:", err);
-      try {
-        await ctx.reply("Не смог создать PDF 😕 Попробуй ещё раз.");
-      } catch (_) {}
-    });
+      // 3) Send PDF
+      const fileName = `invoice_${Date.now()}.pdf`;
+      await ctx.replyWithDocument({ source: pdfBuffer, filename: fileName });
 
-    doc.on("end", async () => {
-      try {
-        const pdfBuffer = Buffer.concat(chunks);
-
-        const amountStr = formatMoney(d.amount);
-        const dateStr = formatDateEuropeWarsaw(new Date());
-
-        // отправляем PDF
-        await ctx.replyWithDocument({ source: pdfBuffer, filename: fileName });
-
-        // подтверждение
-        await ctx.reply(
-          `Готово ✅\n\nКлиент: ${d.client}\nУслуга: ${d.service}\nСумма: ${amountStr} ${d.currency}\nДата: ${dateStr}`
-        );
-      } catch (err) {
-        console.error("Send error:", err);
-        await ctx.reply("Не смог отправить PDF 😕 Попробуй ещё раз.");
-      }
-    });
-
-    // наполнение PDF
-    const amountStr = formatMoney(d.amount);
-    const dateStr = formatDateEuropeWarsaw(new Date());
-
-    doc.fontSize(20).text("INVOICE", { align: "center" });
-    doc.moveDown();
-
-    doc.fontSize(12).text(`Клиент: ${d.client}`);
-    doc.text(`Услуга: ${d.service}`);
-    doc.text(`Сумма: ${amountStr} ${d.currency}`);
-    doc.text(`Дата: ${dateStr}`);
-
-    doc.end();
-    return;
+      // 4) Confirmation + Pay button
+      await ctx.reply(
+        `Готово ✅\n\nКлиент: ${d.client}\nУслуга: ${d.service}\nСумма: ${amountStr} ${d.currency}\nДата: ${dateStr}\n\nОплата:`,
+        Markup.inlineKeyboard([Markup.button.url("💳 Оплатить", checkoutUrl)])
+      );
+    } catch (err) {
+      console.error("Checkout/PDF error:", err);
+      await ctx.reply(
+        "Не смог сделать оплату/ PDF 😕\nПроверь STRIPE_* переменные и логи Railway."
+      );
+    }
   }
 });
 
